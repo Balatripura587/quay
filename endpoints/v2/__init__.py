@@ -1,4 +1,5 @@
 import logging
+import os
 import os.path
 from functools import wraps
 from urllib.parse import urlencode
@@ -39,6 +40,17 @@ from util.registry.dockerver import docker_version
 
 logger = logging.getLogger(__name__)
 v2_bp = timed_blueprint(Blueprint("v2", __name__), get_app=lambda: app)
+
+# Optional: log every v2 request and handler (set TRACE_V2_REQUESTS=1 for local dev)
+if os.environ.get("TRACE_V2_REQUESTS"):
+    @v2_bp.before_request
+    def _log_v2_request():
+        logger.info(
+            "v2 request: %s %s -> %s",
+            request.method,
+            request.path,
+            request.endpoint or "(no endpoint)",
+        )
 
 
 @v2_bp.app_errorhandler(V2RegistryException)
