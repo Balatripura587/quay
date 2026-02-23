@@ -1,4 +1,5 @@
 import logging
+import traceback
 from functools import wraps
 
 from flask import Response, request, url_for
@@ -50,9 +51,12 @@ from image.docker.schema1 import (
 )
 from image.docker.schema2 import DOCKER_SCHEMA2_CONTENT_TYPES
 from image.oci import OCI_CONTENT_TYPES
+from image.oci.manifest import MalformedOCIManifest
 from image.shared import ManifestException
 from image.shared.schemas import parse_manifest_from_bytes
 from notifications import spawn_notification
+import pyroscope
+
 from util.audit import track_and_log
 from util.bytes import Bytes
 from util.names import VALID_TAG_PATTERN
@@ -74,82 +78,83 @@ MANIFEST_TAGNAME_ROUTE = BASE_MANIFEST_ROUTE.format(VALID_TAG_PATTERN)
 @anon_protect
 @inject_registry_model()
 def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_model):
-    try:
-        repository_ref = registry_model.lookup_repository(
-            namespace_name,
-            repo_name,
-            raise_on_error=True,
-            manifest_ref=manifest_ref,
-            model_cache=model_cache,
-        )
-    except RepositoryDoesNotExist as e:
-        image_pulls.labels("v2", "tag", 404).inc()
-        raise NameUnknown("repository not found")
-
-    try:
-        tag = registry_model.get_repo_tag(repository_ref, manifest_ref, raise_on_error=True)
-    except TagDoesNotExist as e:
-        if registry_model.has_expired_tag(repository_ref, manifest_ref):
-            logger.debug(
-                "Found expired tag %s for repository %s/%s", manifest_ref, namespace_name, repo_name
-            )
-            msg = (
-                "Tag %s was deleted or has expired. To pull, revive via time machine" % manifest_ref
-            )
-            image_pulls.labels("v2", "tag", 404).inc()
-            raise TagExpired(msg)
-
-        image_pulls.labels("v2", "tag", 404).inc()
-        raise ManifestUnknown(str(e))
-
-    manifest = registry_model.get_manifest_for_tag(tag)
-    if manifest is None:
-        # Something went wrong.
-        image_pulls.labels("v2", "tag", 400).inc()
-        raise ManifestInvalid()
-
-    try:
-        manifest_bytes, manifest_digest, manifest_media_type = _rewrite_schema_if_necessary(
-            namespace_name, repo_name, manifest_ref, manifest, registry_model
-        )
-    except (ManifestException, ManifestDoesNotExist) as e:
-        image_pulls.labels("v2", "tag", 404).inc()
-        raise ManifestUnknown(str(e))
-
-    if manifest_bytes is None:
-        image_pulls.labels("v2", "tag", 404).inc()
-        raise ManifestUnknown()
-
-    track_and_log(
-        "pull_repo",
-        repository_ref,
-        analytics_name="pull_repo_100x",
-        analytics_sample=0.01,
-        tag=manifest_ref,
-        mediaType=manifest_media_type,
-    )
-    image_pulls.labels("v2", "tag", 200).inc()
-
-    # Track pull metrics if feature is enabled
-    if features.IMAGE_PULL_STATS:
+    with pyroscope.tag_wrapper({"controller": "fetch_manifest_by_tagname"}):
         try:
-            if pullmetrics:
-                metrics = pullmetrics.get_event()
-                metrics.track_tag_pull(repository_ref, manifest_ref, manifest_digest)
-        except Exception as e:
-            logger.warning(
-                "Could not track tag pull metrics: %s. " "Pull statistics may not be recorded.",
-                str(e),
+            repository_ref = registry_model.lookup_repository(
+                namespace_name,
+                repo_name,
+                raise_on_error=True,
+                manifest_ref=manifest_ref,
+                model_cache=model_cache,
             )
+        except RepositoryDoesNotExist as e:
+            image_pulls.labels("v2", "tag", 404).inc()
+            raise NameUnknown("repository not found")
 
-    return Response(
-        manifest_bytes.as_unicode(),
-        status=200,
-        headers={
-            "Content-Type": manifest_media_type,
-            "Docker-Content-Digest": manifest_digest,
-        },
-    )
+        try:
+            tag = registry_model.get_repo_tag(repository_ref, manifest_ref, raise_on_error=True)
+        except TagDoesNotExist as e:
+            if registry_model.has_expired_tag(repository_ref, manifest_ref):
+                logger.debug(
+                    "Found expired tag %s for repository %s/%s", manifest_ref, namespace_name, repo_name
+                )
+                msg = (
+                    "Tag %s was deleted or has expired. To pull, revive via time machine" % manifest_ref
+                )
+                image_pulls.labels("v2", "tag", 404).inc()
+                raise TagExpired(msg)
+
+            image_pulls.labels("v2", "tag", 404).inc()
+            raise ManifestUnknown(str(e))
+
+        manifest = registry_model.get_manifest_for_tag(tag)
+        if manifest is None:
+            # Something went wrong.
+            image_pulls.labels("v2", "tag", 400).inc()
+            raise ManifestInvalid()
+
+        try:
+            manifest_bytes, manifest_digest, manifest_media_type = _rewrite_schema_if_necessary(
+                namespace_name, repo_name, manifest_ref, manifest, registry_model
+            )
+        except (ManifestException, ManifestDoesNotExist) as e:
+            image_pulls.labels("v2", "tag", 404).inc()
+            raise ManifestUnknown(str(e))
+
+        if manifest_bytes is None:
+            image_pulls.labels("v2", "tag", 404).inc()
+            raise ManifestUnknown()
+
+        track_and_log(
+            "pull_repo",
+            repository_ref,
+            analytics_name="pull_repo_100x",
+            analytics_sample=0.01,
+            tag=manifest_ref,
+            mediaType=manifest_media_type,
+        )
+        image_pulls.labels("v2", "tag", 200).inc()
+
+        # Track pull metrics if feature is enabled
+        if features.IMAGE_PULL_STATS:
+            try:
+                if pullmetrics:
+                    metrics = pullmetrics.get_event()
+                    metrics.track_tag_pull(repository_ref, manifest_ref, manifest_digest)
+            except Exception as e:
+                logger.warning(
+                    "Could not track tag pull metrics: %s. " "Pull statistics may not be recorded.",
+                    str(e),
+                )
+
+        return Response(
+            manifest_bytes.as_unicode(),
+            status=200,
+            headers={
+                "Content-Type": manifest_media_type,
+                "Docker-Content-Digest": manifest_digest,
+            },
+        )
 
 
 @v2_bp.route(MANIFEST_DIGEST_ROUTE, methods=["GET"])
@@ -161,56 +166,57 @@ def fetch_manifest_by_tagname(namespace_name, repo_name, manifest_ref, registry_
 @anon_protect
 @inject_registry_model()
 def fetch_manifest_by_digest(namespace_name, repo_name, manifest_ref, registry_model):
-    try:
-        repository_ref = registry_model.lookup_repository(
-            namespace_name,
-            repo_name,
-            raise_on_error=True,
-            manifest_ref=manifest_ref,
-            model_cache=model_cache,
-        )
-    except RepositoryDoesNotExist as e:
-        image_pulls.labels("v2", "manifest", 404).inc()
-        raise NameUnknown("repository not found")
-
-    try:
-        manifest = registry_model.lookup_cached_manifest_by_digest(
-            model_cache,
-            repository_ref,
-            manifest_ref,
-            raise_on_error=True,
-            allow_hidden=True,
-        )
-    except ManifestDoesNotExist as e:
-        image_pulls.labels("v2", "manifest", 404).inc()
-        raise ManifestUnknown(str(e))
-
-    track_and_log(
-        "pull_repo", repository_ref, manifest_digest=manifest_ref, mediaType=manifest.media_type
-    )
-    image_pulls.labels("v2", "manifest", 200).inc()
-
-    # Track pull metrics if feature is enabled
-    if features.IMAGE_PULL_STATS:
+    with pyroscope.tag_wrapper({"controller": "fetch_manifest_by_digest"}):
         try:
-            if pullmetrics:
-                metrics = pullmetrics.get_event()
-                metrics.track_manifest_pull(repository_ref, manifest_ref)
-        except Exception as e:
-            logger.warning(
-                "Could not track manifest pull metrics: %s. "
-                "Pull statistics may not be recorded.",
-                str(e),
+            repository_ref = registry_model.lookup_repository(
+                namespace_name,
+                repo_name,
+                raise_on_error=True,
+                manifest_ref=manifest_ref,
+                model_cache=model_cache,
             )
+        except RepositoryDoesNotExist as e:
+            image_pulls.labels("v2", "manifest", 404).inc()
+            raise NameUnknown("repository not found")
 
-    return Response(
-        manifest.internal_manifest_bytes.as_unicode(),
-        status=200,
-        headers={
-            "Content-Type": manifest.media_type,
-            "Docker-Content-Digest": manifest.digest,
-        },
-    )
+        try:
+            manifest = registry_model.lookup_cached_manifest_by_digest(
+                model_cache,
+                repository_ref,
+                manifest_ref,
+                raise_on_error=True,
+                allow_hidden=True,
+            )
+        except ManifestDoesNotExist as e:
+            image_pulls.labels("v2", "manifest", 404).inc()
+            raise ManifestUnknown(str(e))
+
+        track_and_log(
+            "pull_repo", repository_ref, manifest_digest=manifest_ref, mediaType=manifest.media_type
+        )
+        image_pulls.labels("v2", "manifest", 200).inc()
+
+        # Track pull metrics if feature is enabled
+        if features.IMAGE_PULL_STATS:
+            try:
+                if pullmetrics:
+                    metrics = pullmetrics.get_event()
+                    metrics.track_manifest_pull(repository_ref, manifest_ref)
+            except Exception as e:
+                logger.warning(
+                    "Could not track manifest pull metrics: %s. "
+                    "Pull statistics may not be recorded.",
+                    str(e),
+                )
+
+        return Response(
+            manifest.internal_manifest_bytes.as_unicode(),
+            status=200,
+            headers={
+                "Content-Type": manifest.media_type,
+                "Docker-Content-Digest": manifest.digest,
+            },
+        )
 
 
 def _rewrite_schema_if_necessary(
@@ -307,8 +313,18 @@ def _doesnt_accept_schema_v1():
 @check_pushes_disabled
 def write_manifest_by_tagname(namespace_name, repo_name, manifest_ref):
     parsed = _parse_manifest(request.content_type, request.data)
-
-    return _write_manifest_and_log(namespace_name, repo_name, manifest_ref, parsed)
+    try:
+        return _write_manifest_and_log(namespace_name, repo_name, manifest_ref, parsed)
+    except Exception as e:
+        logger.exception(
+            "Manifest PUT failed for %s/%s ref %s: %s\n%s",
+            namespace_name,
+            repo_name,
+            manifest_ref,
+            e,
+            traceback.format_exc(),
+        )
+        raise
 
 
 def _enqueue_blobs_for_replication(manifest, storage, namespace_name):
@@ -526,6 +542,8 @@ def _write_manifest(
         raise ManifestInvalid(detail={"message": str(cme)})
     except RetargetTagException as rte:
         raise ManifestInvalid(detail={"message": str(rte)})
+    except MalformedOCIManifest as moe:
+        raise ManifestInvalid(detail={"message": str(moe)})
     except ImmutableTagException as ite:
         raise TagImmutable(detail={"message": f"tag '{ite.tag_name}' is immutable"}) from ite
     except QuotaExceededException as qee:

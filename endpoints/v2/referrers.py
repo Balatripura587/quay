@@ -1,3 +1,4 @@
+import pyroscope
 from flask import Response, request
 
 import features
@@ -34,31 +35,32 @@ MANIFEST_REFERRERS_ROUTE = BASE_REFERRERS_ROUTE.format(digest_tools.DIGEST_PATTE
 @anon_protect
 @inject_registry_model()
 def list_manifest_referrers(namespace_name, repo_name, manifest_ref, registry_model):
-    try:
-        repository_ref = registry_model.lookup_repository(
-            namespace_name, repo_name, raise_on_error=True, manifest_ref=manifest_ref
+    with pyroscope.tag_wrapper({"controller": "list_manifest_referrers"}):
+        try:
+            repository_ref = registry_model.lookup_repository(
+                namespace_name, repo_name, raise_on_error=True, manifest_ref=manifest_ref
+            )
+        except RepositoryDoesNotExist as e:
+            raise NameUnknown("repository not found")
+
+        try:
+            manifest = registry_model.lookup_manifest_by_digest(
+                repository_ref, manifest_ref, raise_on_error=True, allow_hidden=True
+            )
+        except ManifestDoesNotExist as e:
+            raise ManifestInvalid(str(e))
+
+        artifact_type = request.args.get("artifactType", None)
+
+        referrers = registry_model.lookup_cached_referrers_for_manifest(
+            model_cache, repository_ref, manifest, artifact_type
         )
-    except RepositoryDoesNotExist as e:
-        raise NameUnknown("repository not found")
+        index = _build_referrers_index_for_manifests(referrers)
+        headers = {"Content-Type": index.media_type}
+        if artifact_type is not None:
+            headers["OCI-Filters-Applied"] = "artifactType"
 
-    try:
-        manifest = registry_model.lookup_manifest_by_digest(
-            repository_ref, manifest_ref, raise_on_error=True, allow_hidden=True
-        )
-    except ManifestDoesNotExist as e:
-        raise ManifestInvalid(str(e))
-
-    artifact_type = request.args.get("artifactType", None)
-
-    referrers = registry_model.lookup_cached_referrers_for_manifest(
-        model_cache, repository_ref, manifest, artifact_type
-    )
-    index = _build_referrers_index_for_manifests(referrers)
-    headers = {"Content-Type": index.media_type}
-    if artifact_type is not None:
-        headers["OCI-Filters-Applied"] = "artifactType"
-
-    return Response(index.bytes.as_unicode(), status=200, headers=headers)
+        return Response(index.bytes.as_unicode(), status=200, headers=headers)
 
 
 def _build_referrers_index_for_manifests(referrers):

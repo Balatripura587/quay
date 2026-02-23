@@ -46,6 +46,7 @@ packages = [
     "psutil",
     "PyJWT",
     "pyOpenSSL",
+    "pyroscope-io",
     "sentry-sdk",
     "requests",
     "Werkzeug",

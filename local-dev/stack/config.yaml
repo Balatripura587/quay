@@ -91,6 +91,8 @@ DEFAULT_NAMESPACE_AUTOPRUNE_POLICY:
   value: 100
 FEATURE_IMAGE_EXPIRY_TRIGGER: true
 BROWSER_API_CALLS_XHR_ONLY: False
+# From inside Docker, use host.docker.internal to reach Pyroscope on your Mac
+PYROSCOPE_SERVER_ADDRESS: "http://host.docker.internal:4040"
 # CORS_ORIGIN: "https://stage.foo.redhat.com:1337 http://localhost:9000/"
 CORS_ORIGIN:
   - "https://stage.foo.redhat.com:1337"

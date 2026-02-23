@@ -47,6 +47,8 @@ from endpoints.v2.errors import (
     QuotaExceeded,
     Unsupported,
 )
+import pyroscope
+
 from util.cache import cache_control
 from util.names import parse_namespace_repository
 from util.request import get_request_ip
@@ -68,24 +70,25 @@ BLOB_CONTENT_TYPE = "application/octet-stream"
 @cache_control(max_age=31436000)
 @inject_registry_model()
 def check_blob_exists(namespace_name, repo_name, digest, registry_model):
-    # Find the blob.
-    blob = registry_model.get_cached_repo_blob(model_cache, namespace_name, repo_name, digest)
-    if blob is None:
-        raise BlobUnknown()
+    with pyroscope.tag_wrapper({"controller": "check_blob_exists"}):
+        # Find the blob.
+        blob = registry_model.get_cached_repo_blob(model_cache, namespace_name, repo_name, digest)
+        if blob is None:
+            raise BlobUnknown()
 
-    # Build the response headers.
-    headers = {
-        "Docker-Content-Digest": digest,
-        "Content-Length": blob.compressed_size,
-        "Content-Type": BLOB_CONTENT_TYPE,
-    }
+        # Build the response headers.
+        headers = {
+            "Docker-Content-Digest": digest,
+            "Content-Length": blob.compressed_size,
+            "Content-Type": BLOB_CONTENT_TYPE,
+        }
 
-    # If our storage supports range requests, let the client know.
-    if storage.get_supports_resumable_downloads(blob.placements):
-        headers["Accept-Ranges"] = "bytes"
+        # If our storage supports range requests, let the client know.
+        if storage.get_supports_resumable_downloads(blob.placements):
+            headers["Accept-Ranges"] = "bytes"
 
-    # Write the response to the client.
-    return Response(headers=headers)
+        # Write the response to the client.
+        return Response(headers=headers)
 
 
 @v2_bp.route(BLOB_DIGEST_ROUTE, methods=["GET"])
@@ -98,59 +101,60 @@ def check_blob_exists(namespace_name, repo_name, digest, registry_model):
 @cache_control(max_age=31536000)
 @inject_registry_model()
 def download_blob(namespace_name, repo_name, digest, registry_model):
-    # Find the blob.
-    blob = registry_model.get_cached_repo_blob(model_cache, namespace_name, repo_name, digest)
-    if blob is None:
-        raise BlobUnknown()
+    with pyroscope.tag_wrapper({"controller": "download_blob"}):
+        # Find the blob.
+        blob = registry_model.get_cached_repo_blob(model_cache, namespace_name, repo_name, digest)
+        if blob is None:
+            raise BlobUnknown()
 
-    # Build the response headers.
-    headers = {"Docker-Content-Digest": digest}
+        # Build the response headers.
+        headers = {"Docker-Content-Digest": digest}
 
-    # If our storage supports range requests, let the client know.
-    if storage.get_supports_resumable_downloads(blob.placements):
-        headers["Accept-Ranges"] = "bytes"
+        # If our storage supports range requests, let the client know.
+        if storage.get_supports_resumable_downloads(blob.placements):
+            headers["Accept-Ranges"] = "bytes"
 
-    image_pulled_bytes.labels("v2").inc(blob.compressed_size)
+        image_pulled_bytes.labels("v2").inc(blob.compressed_size)
 
-    # Short-circuit by redirecting if the storage supports it.
-    path = blob.storage_path
-    logger.debug("Looking up the direct download URL for path: %s", path)
+        # Short-circuit by redirecting if the storage supports it.
+        path = blob.storage_path
+        logger.debug("Looking up the direct download URL for path: %s", path)
 
-    # TODO (syahmed): the call below invokes a DB call to get the user
-    # optimize so we don't have to go to the DB but read from the
-    # token instead
-    user = get_authenticated_user()
-    username = user.username if user else None
-    direct_download_url = storage.get_direct_download_url(
-        blob.placements,
-        path,
-        get_request_ip(),
-        username=username,
-        namespace=namespace_name,
-        repo_name=repo_name,
-        cdn_specific=_is_cdn_specific(namespace_name),
-    )
-    if direct_download_url:
-        logger.debug("Returning direct download URL")
-        resp = redirect(direct_download_url)
-        resp.headers.extend(headers)
-        return resp
-
-    # Close the database connection before we stream the download.
-    logger.debug("Closing database connection before streaming layer data")
-    headers.update(
-        {
-            "Content-Length": blob.compressed_size,
-            "Content-Type": BLOB_CONTENT_TYPE,
-        }
-    )
-
-    with database.CloseForLongOperation(app.config):
-        # Stream the response to the client.
-        return Response(
-            storage.stream_read(blob.placements, path),
-            headers=headers,
+        # TODO (syahmed): the call below invokes a DB call to get the user
+        # optimize so we don't have to go to the DB but read from the
+        # token instead
+        user = get_authenticated_user()
+        username = user.username if user else None
+        direct_download_url = storage.get_direct_download_url(
+            blob.placements,
+            path,
+            get_request_ip(),
+            username=username,
+            namespace=namespace_name,
+            repo_name=repo_name,
+            cdn_specific=_is_cdn_specific(namespace_name),
         )
+        if direct_download_url:
+            logger.debug("Returning direct download URL")
+            resp = redirect(direct_download_url)
+            resp.headers.extend(headers)
+            return resp
+
+        # Close the database connection before we stream the download.
+        logger.debug("Closing database connection before streaming layer data")
+        headers.update(
+            {
+                "Content-Length": blob.compressed_size,
+                "Content-Type": BLOB_CONTENT_TYPE,
+            }
+        )
+
+        with database.CloseForLongOperation(app.config):
+            # Stream the response to the client.
+            return Response(
+                storage.stream_read(blob.placements, path),
+                headers=headers,
+            )
 
 
 def _is_cdn_specific(namespace):

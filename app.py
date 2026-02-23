@@ -154,6 +154,23 @@ CONFIG_DIGEST = hashlib.sha256(json.dumps(app.config, default=str).encode("utf-8
 
 logger.debug("Loaded config", extra={"config": app.config})
 
+# Pyroscope continuous profiling (optional)
+_pyroscope_server = app.config.get("PYROSCOPE_SERVER_ADDRESS") or os.environ.get(
+    "PYROSCOPE_SERVER_ADDRESS"
+)
+if _pyroscope_server and not is_testing:
+    try:
+        import pyroscope
+
+        pyroscope.configure(
+            application_name="quay",
+            server_address=_pyroscope_server,
+            enable_logging=True,
+        )
+        logger.info("Pyroscope profiling enabled", extra={"server": _pyroscope_server})
+    except Exception as e:
+        logger.warning("Pyroscope profiling disabled: %s", e, exc_info=True)
+
 
 class RequestWithId(Request):
     request_gen = staticmethod(urn_generator(["request"]))
@@ -165,24 +182,27 @@ class RequestWithId(Request):
 
 @app.before_request
 def _request_start():
-    if os.getenv("PYDEV_DEBUG", None):
-        import pydevd_pycharm
+    import pyroscope
 
-        host, port = os.getenv("PYDEV_DEBUG").split(":")
-        pydevd_pycharm.settrace(
-            host,
-            port=int(port),
-            stdoutToServer=True,
-            stderrToServer=True,
-            suspend=False,
-        )
+    with pyroscope.tag_wrapper({"controller": "app_request_entry"}):
+        if os.getenv("PYDEV_DEBUG", None):
+            import pydevd_pycharm
 
-    debug_extra = {}
-    x_forwarded_for = request.headers.get("X-Forwarded-For", None)
-    if x_forwarded_for is not None:
-        debug_extra["X-Forwarded-For"] = x_forwarded_for
+            host, port = os.getenv("PYDEV_DEBUG").split(":")
+            pydevd_pycharm.settrace(
+                host,
+                port=int(port),
+                stdoutToServer=True,
+                stderrToServer=True,
+                suspend=False,
+            )
 
-    logger.debug("Starting request: %s (%s) %s", request.request_id, request.path, debug_extra)
+        debug_extra = {}
+        x_forwarded_for = request.headers.get("X-Forwarded-For", None)
+        if x_forwarded_for is not None:
+            debug_extra["X-Forwarded-For"] = x_forwarded_for
+
+        logger.debug("Starting request: %s (%s) %s", request.request_id, request.path, debug_extra)
 
 
 DEFAULT_FILTER = lambda x: "[FILTERED]"

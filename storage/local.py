@@ -3,11 +3,17 @@ import io
 import logging
 import os
 import shutil
+from contextlib import nullcontext
 from uuid import uuid4
 
 import psutil
 
 from storage.basestorage import BaseStorageV2
+
+try:
+    import pyroscope
+except ImportError:
+    pyroscope = None
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +44,18 @@ class LocalStorage(BaseStorageV2):
 
     def stream_read(self, path):
         path = self._init_path(path)
+        tag_context = (
+            pyroscope.tag_wrapper({"controller": "storage_stream_read"})
+            if pyroscope
+            else nullcontext()
+        )
         with open(path, mode="rb") as f:
-            while True:
-                buf = f.read(self.buffer_size)
-                if not buf:
-                    break
-                yield buf
+            with tag_context:
+                while True:
+                    buf = f.read(self.buffer_size)
+                    if not buf:
+                        break
+                    yield buf
 
     def stream_read_file(self, path):
         path = self._init_path(path)

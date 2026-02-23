@@ -1,3 +1,4 @@
+import pyroscope
 from flask import jsonify
 
 from app import app, model_cache
@@ -25,26 +26,27 @@ from endpoints.v2.errors import NameUnknown, TooManyTagsRequested
 @anon_protect
 @oci_tag_paginate()
 def list_all_tags(namespace_name, repo_name, last_pagination_tag_name, limit, pagination_callback):
-    repository_ref = registry_model.lookup_repository(namespace_name, repo_name)
-    if repository_ref is None:
-        raise NameUnknown("repository not found")
+    with pyroscope.tag_wrapper({"controller": "list_all_tags"}):
+        repository_ref = registry_model.lookup_repository(namespace_name, repo_name)
+        if repository_ref is None:
+            raise NameUnknown("repository not found")
 
-    tags = []
-    has_more = False
+        tags = []
+        has_more = False
 
-    if limit > 0:
-        tags, has_more = registry_model.lookup_cached_active_repository_tags(
-            model_cache, repository_ref, last_pagination_tag_name, limit
+        if limit > 0:
+            tags, has_more = registry_model.lookup_cached_active_repository_tags(
+                model_cache, repository_ref, last_pagination_tag_name, limit
+            )
+
+        response = jsonify(
+            {
+                "name": f"{namespace_name}/{repo_name}",
+                "tags": [tag.name for tag in tags][0:limit],
+            }
         )
 
-    response = jsonify(
-        {
-            "name": f"{namespace_name}/{repo_name}",
-            "tags": [tag.name for tag in tags][0:limit],
-        }
-    )
+        if limit > 0:
+            pagination_callback(tags, has_more, response)
 
-    if limit > 0:
-        pagination_callback(tags, has_more, response)
-
-    return response
+        return response

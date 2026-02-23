@@ -961,6 +961,9 @@ class DefaultConfig(ImmutableConfig):
     FEATURE_OTEL_TRACING = False
     OTEL_TRACING_EXCLUDED_URLS = None
 
+    # Pyroscope continuous profiling (e.g. http://my-pyroscope-server:4040)
+    PYROSCOPE_SERVER_ADDRESS = None
+
     # Metrics tracking namespaces
     # Supports two formats:
     # 1. List format: ["namespace1", "namespace2"] - each namespace gets its own label

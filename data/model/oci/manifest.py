@@ -33,6 +33,7 @@ from data.model.storage import lookup_repo_storages_by_content_checksum
 from image.docker.schema1 import ManifestException
 from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.docker.schema2.list import MalformedSchema2ManifestList
+from image.oci.manifest import MalformedOCIManifest
 from image.shared.interfaces import ManifestInterface, ManifestListInterface
 from util.validation import is_json
 
@@ -346,8 +347,17 @@ def _create_manifest(
             if child_manifest is None:
                 continue
 
-            # Retrieve its labels.
-            labels = child_manifest.get_manifest_labels(retriever)
+            # Retrieve its labels. If the config blob is not yet visible (e.g. eventual
+            # consistency), use empty labels so the push can succeed.
+            try:
+                labels = child_manifest.get_manifest_labels(retriever)
+            except MalformedOCIManifest as ex:
+                logger.warning(
+                    "Could not load manifest labels for child of %s: %s. Using empty labels.",
+                    manifest_interface_instance.digest,
+                    ex,
+                )
+                labels = {}
             if labels is None and isinstance(child_manifest, ManifestInterface):
                 if raise_on_error:
                     raise CreateManifestException("Unable to retrieve manifest labels")
